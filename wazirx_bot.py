@@ -1,316 +1,459 @@
-import os
+# wazirx_bot.py
+from flask import Flask, request, jsonify
+import ccxt
+from wazirx_config import *
+from datetime import datetime, timedelta
 import json
 import time
-import threading
 import requests
-import ccxt
-from flask import Flask, request, jsonify
-from datetime import datetime, timedelta
-from functools import wraps
-from wazirx_config import *
 
 app = Flask(__name__)
 
-# ============= GLOBAL DATA & LOCKS =============
-data_lock = threading.Lock()
-log_lock = threading.Lock()
+# ============= INITIALIZE WAZIRX =============
+exchange = ccxt.wazirx({
+    'apiKey': uAmqQjmmwUYwPu04T8zOXAGgwO42DjHWrtEjh1K66l0HzKUgJLPAr98ThDYX8355,
+    'secret': ENmclYgpDUMfc90dHwuEOo4rjWUt5GrAoabKFtYU,
+    'enableRateLimit': True,
+    'options': {
+        'defaultType': 'spot',  # WazirX only supports spot trading
+    }
+})
 
-# Tracking Variables
+# ============= DAILY TRACKING =============
 daily_pnl_usdt = 0
+daily_pnl_inr = 0
 last_reset_date = datetime.now().date()
 total_trades_today = 0
 winning_trades_today = 0
 losing_trades_today = 0
-active_orders = {}  # Format: {order_id: {data}}
 
-# ============= EXCHANGE INITIALIZATION =============
-def get_exchange_instance():
-    return ccxt.wazirx({
-        'apiKey': WAZIRX_API_KEY,
-        'secret': WAZIRX_SECRET_KEY,
-        'enableRateLimit': True,
-        'timeout': 30000,
-        'options': {'defaultType': 'spot'}
-    })
+# ============= ACTIVE ORDERS TRACKING =============
+active_orders = {}  # {order_id: {symbol, side, sl, tp, entry_price}}
 
-exchange = get_exchange_instance()
+def reset_daily_tracker():
+    global daily_pnl_usdt, daily_pnl_inr, last_reset_date, total_trades_today
+    global winning_trades_today, losing_trades_today
+    
+    today = datetime.now().date()
+    if today != last_reset_date:
+        daily_pnl_usdt = 0
+        daily_pnl_inr = 0
+        total_trades_today = 0
+        winning_trades_today = 0
+        losing_trades_today = 0
+        last_reset_date = today
+        log_message(f"✅ Daily tracker reset: {today}")
 
-# ============= LOGGING & NOTIFICATIONS =============
+# ============= LOGGING =============
 def log_message(message):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_entry = f"[{timestamp}] {message}"
-    with log_lock:
-        print(log_entry)
-        if LOG_TRADES_TO_FILE:
-            try:
-                with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
-                    f.write(log_entry + "\n")
-            except: pass
+    print(log_entry)
+    
+    if LOG_TRADES_TO_FILE:
+        try:
+            with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
+                f.write(log_entry + "\n")
+        except Exception as e:
+            print(f"❌ Logging error: {e}")
 
+# ============= TELEGRAM NOTIFICATIONS =============
 def send_telegram(message):
     if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN:
         return
+    
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        payload = {
+        data = {
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "HTML"
         }
-        requests.post(url, json=payload, timeout=10)
+        requests.post(url, data=data, timeout=5)
     except Exception as e:
-        log_message(f"❌ Telegram Error: {e}")
+        log_message(f"❌ Telegram error: {e}")
 
-# ============= HELPER DECORATORS =============
-def retry_on_failure(max_retries=3, delay=2):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            for attempt in range(max_retries):
-                try:
-                    return func(*args, **kwargs)
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        log_message(f"🚨 Final attempt failed for {func.__name__}: {e}")
-                        return None
-                    time.sleep(delay * (attempt + 1))
-            return None
-        return wrapper
-    return decorator
+# ============= GET CURRENT BALANCE =============
+def get_balance():
+    try:
+        balance = exchange.fetch_balance()
+        usdt_free = balance.get('USDT', {}).get('free', 0)
+        usdt_total = balance.get('USDT', {}).get('total', 0)
+        
+        return {
+            'usdt_free': usdt_free,
+            'usdt_total': usdt_total
+        }
+    except Exception as e:
+        log_message(f"❌ Balance fetch error: {e}")
+        return {'usdt_free': 0, 'usdt_total': 0}
 
-# ============= CORE EXCHANGE FUNCTIONS =============
-@retry_on_failure()
-def fetch_safe_balance():
-    """Fetch balance with None-check to prevent unpacking errors"""
-    balance = exchange.fetch_balance()
-    if not balance or 'USDT' not in balance:
-        return {'free': 0, 'total': 0}
-    return {
-        'free': float(balance['USDT'].get('free', 0)),
-        'total': float(balance['USDT'].get('total', 0))
-    }
-
-@retry_on_failure()
+# ============= GET CURRENT PRICE =============
 def get_current_price(symbol):
-    ticker = exchange.fetch_ticker(symbol.upper())
-    return float(ticker['last']) if ticker else None
-
-# ============= TRADING LOGIC =============
-def reset_daily_stats_if_needed():
-    global daily_pnl_usdt, last_reset_date, total_trades_today
-    global winning_trades_today, losing_trades_today
-    
-    today = datetime.now().date()
-    with data_lock:
-        if today != last_reset_date:
-            daily_pnl_usdt = 0
-            total_trades_today = 0
-            winning_trades_today = 0
-            losing_trades_today = 0
-            last_reset_date = today
-            log_message("📅 Daily stats reset for new day.")
-
-def calculate_position_size(symbol, entry_price, sl_price):
     try:
-        balance_data = fetch_safe_balance()
-        if not balance_data:
-            return 0, "Could not fetch balance from Exchange"
-            
-        usdt_free = balance_data['free']
-        usable_balance = usdt_free - MIN_BALANCE_USDT
-        
-        if usable_balance < 1:
-            return 0, f"Low Balance: ${usdt_free:.2f}"
-            
-        # Risk management
-        risk_per_trade = usable_balance * (RISK_PER_TRADE_PERCENT / 100)
-        sl_percent = abs(entry_price - sl_price) / entry_price
-        
-        if sl_percent <= 0: return 0, "Invalid SL/Price ratio"
-        
-        # Position Size in USDT
-        pos_size_usdt = risk_per_trade / sl_percent
-        pos_size_usdt = min(pos_size_usdt, MAX_POSITION_SIZE_USDT)
-        pos_size_usdt = min(pos_size_usdt, usable_balance * 0.9) # Max 90% use
-        
-        qty = pos_size_usdt / entry_price
-        
-        # Precision Handling
-        markets = exchange.load_markets()
-        market = markets.get(symbol.upper())
-        if market and 'precision' in market:
-            amt_precision = market['precision'].get('amount', 8)
-            qty = round(qty, amt_precision)
-            
-        # Min Order Check
-        if (qty * entry_price) < 1.0:
-            return 0, "Calculated order size below $1 minimum"
-            
-        return qty, "OK"
+        ticker = exchange.fetch_ticker(symbol)
+        return ticker['last']
     except Exception as e:
-        return 0, f"Calc Error: {str(e)}"
-
-@retry_on_failure(max_retries=2)
-def execute_trade(symbol, side, qty, price, sl, tp):
-    try:
-        if DRY_RUN:
-            oid = f"DRY_{int(time.time())}"
-            log_message(f"🔍 [DRY RUN] {side.upper()} {qty} {symbol} @ {price}")
-        else:
-            # WazirX limit order
-            order = exchange.create_limit_order(symbol.upper(), side.lower(), qty, price)
-            oid = order['id']
-            log_message(f"✅ [LIVE] Order Placed: {oid}")
-
-        with data_lock:
-            active_orders[oid] = {
-                'symbol': symbol, 'side': side.lower(), 'qty': qty,
-                'entry': price, 'sl': sl, 'tp': tp,
-                'time': datetime.now(), 'status': 'open'
-            }
-        
-        send_telegram(f"🔔 <b>Trade Opened</b>\nSymbol: {symbol}\nSide: {side}\nQty: {qty}\nPrice: {price}\nSL: {sl}\nTP: {tp}")
-        return oid
-    except Exception as e:
-        log_message(f"❌ Execution Error: {e}")
+        log_message(f"❌ Price fetch error for {symbol}: {e}")
         return None
 
-# ============= MONITORING THREAD =============
-def monitor_positions():
-    """Background task to check for SL/TP"""
-    while True:
-        try:
-            reset_daily_stats_if_needed()
-            with data_lock:
-                current_orders = list(active_orders.items())
-            
-            for oid, info in current_orders:
-                symbol = info['symbol']
-                curr_price = get_current_price(symbol)
-                
-                if not curr_price: continue
-                
-                side = info['side']
-                sl = info['sl']
-                tp = info['tp']
-                
-                trigger_close = False
-                reason = ""
-                
-                if side == 'buy':
-                    if curr_price <= sl: trigger_close, reason = True, "Stop Loss"
-                    elif curr_price >= tp: trigger_close, reason = True, "Take Profit"
-                else: # Sell
-                    if curr_price >= sl: trigger_close, reason = True, "Stop Loss"
-                    elif curr_price <= tp: trigger_close, reason = True, "Take Profit"
-                
-                if trigger_close:
-                    handle_close(oid, info, curr_price, reason)
-                    
-        except Exception as e:
-            log_message(f"⚠️ Monitor Error: {e}")
-        time.sleep(20)
-
-def handle_close(oid, info, exit_price, reason):
-    global daily_pnl_usdt, winning_trades_today, losing_trades_today
+# ============= SAFETY CHECKS =============
+def check_safety_limits(data):
+    global daily_pnl_usdt
+    reset_daily_tracker()
     
-    # Calculate PnL
-    pnl = (exit_price - info['entry']) * info['qty'] if info['side'] == 'buy' else (info['entry'] - exit_price) * info['qty']
+    # Check if trading enabled
+    if not TRADING_ENABLED:
+        return False, "❌ Trading is disabled in config"
     
-    if not DRY_RUN:
-        try:
-            close_side = 'sell' if info['side'] == 'buy' else 'buy'
-            exchange.create_market_order(info['symbol'].upper(), close_side, info['qty'])
-        except Exception as e:
-            log_message(f"❌ Failed to close live order {oid}: {e}")
-            return
+    # Daily Loss Check (USDT)
+    if abs(daily_pnl_usdt) >= MAX_DAILY_LOSS_USDT:
+        return False, f"❌ Daily loss limit reached: ${abs(daily_pnl_usdt):.2f}"
+    
+    # Symbol Check
+    symbol = data.get('symbol', '')
+    mapped_symbol = SYMBOL_MAP.get(symbol, symbol).lower()
+    
+    if mapped_symbol not in ALLOWED_SYMBOLS:
+        return False, f"❌ Symbol not allowed: {mapped_symbol}"
+    
+    # Balance Check
+    balance = get_balance()
+    if balance['usdt_free'] < MIN_BALANCE_USDT:
+        return False, f"❌ Insufficient balance: ${balance['usdt_free']:.2f}"
+    
+    # Trading Hours Check (if restricted)
+    if not TRADING_24_7:
+        current_hour = datetime.now().hour
+        if current_hour in RESTRICTED_HOURS:
+            return False, f"❌ Trading restricted at {current_hour}:00 IST"
+    
+    return True, "✅ All safety checks passed"
 
-    with data_lock:
-        daily_pnl_usdt += pnl
-        if pnl > 0: winning_trades_today += 1
-        else: losing_trades_today += 1
-        if oid in active_orders: del active_orders[oid]
+# ============= CALCULATE POSITION SIZE =============
+def calculate_position_size(symbol, entry_price, stop_loss_price):
+    try:
+        balance = get_balance()
+        usdt_free = balance['usdt_free']
         
-    log_message(f"📉 Closed {info['symbol']} at {exit_price} ({reason}). PnL: ${pnl:.2f}")
-    send_telegram(f"🏁 <b>Trade Closed</b>\nSymbol: {info['symbol']}\nReason: {reason}\nExit: {exit_price}\nP&L: ${pnl:.2f}")
+        if usdt_free <= MIN_BALANCE_USDT:
+            return 0, "Insufficient balance"
+        
+        # Available capital for this trade
+        available_capital = usdt_free - MIN_BALANCE_USDT
+        
+        # Risk amount
+        risk_amount = available_capital * (RISK_PER_TRADE_PERCENT / 100)
+        risk_amount = min(risk_amount, MAX_POSITION_SIZE_USDT * 0.02)  # Max 2% risk
+        
+        # SL distance
+        sl_distance_percent = abs(entry_price - stop_loss_price) / entry_price
+        
+        if sl_distance_percent <= 0:
+            return 0, "Invalid SL distance"
+        
+        # Position size in USDT
+        position_size_usdt = risk_amount / sl_distance_percent
+        position_size_usdt = min(position_size_usdt, MAX_POSITION_SIZE_USDT)
+        position_size_usdt = min(position_size_usdt, available_capital * 0.8)  # Max 80% of available
+        
+        # Convert to crypto quantity
+        quantity = position_size_usdt / entry_price
+        
+        # Get market info for precision
+        markets = exchange.load_markets()
+        market = markets.get(symbol.upper())
+        
+        if market:
+            # Round to exchange precision
+            precision = market['precision']['amount']
+            if precision:
+                quantity = round(quantity, precision)
+        
+        # Minimum order size check (WazirX minimum ~$1)
+        min_order_usdt = 1.0
+        if quantity * entry_price < min_order_usdt:
+            return 0, f"Order size too small (min ${min_order_usdt})"
+        
+        return quantity, "OK"
+        
+    except Exception as e:
+        log_message(f"❌ Position size calculation error: {e}")
+        return 0, str(e)
 
-# ============= FLASK ROUTES =============
+# ============= PLACE ORDER =============
+def place_order(symbol, side, quantity, entry_price, sl_price, tp_price):
+    try:
+        if DRY_RUN:
+            log_message(f"🔍 DRY RUN: Would place {side.upper()} {quantity} {symbol} @ ${entry_price}")
+            return {
+                'id': f'DRY_RUN_{int(time.time())}',
+                'status': 'dry_run',
+                'symbol': symbol,
+                'side': side,
+                'price': entry_price,
+                'amount': quantity
+            }
+        
+        # Calculate limit price with slippage
+        if side == 'buy':
+            limit_price = entry_price * (1 + SLIPPAGE_PERCENT / 100)
+        else:
+            limit_price = entry_price * (1 - SLIPPAGE_PERCENT / 100)
+        
+        # Round price to exchange precision
+        markets = exchange.load_markets()
+        market = markets.get(symbol.upper())
+        if market and market['precision']['price']:
+            price_precision = market['precision']['price']
+            limit_price = round(limit_price, price_precision)
+        
+        # Place limit order
+        order = exchange.create_limit_order(
+            symbol=symbol.upper(),
+            side=side,
+            amount=quantity,
+            price=limit_price
+        )
+        
+        log_message(f"✅ Order placed: {order['id']} | {side.upper()} {quantity} {symbol} @ ${limit_price}")
+        
+        # Store order info for SL/TP management
+        active_orders[order['id']] = {
+            'symbol': symbol,
+            'side': side,
+            'quantity': quantity,
+            'entry_price': limit_price,
+            'sl_price': sl_price,
+            'tp_price': tp_price,
+            'timestamp': datetime.now()
+        }
+        
+        # Send Telegram notification
+        msg = f"🚀 <b>Order Placed</b>\n"
+        msg += f"Symbol: {symbol.upper()}\n"
+        msg += f"Side: {side.upper()}\n"
+        msg += f"Quantity: {quantity}\n"
+        msg += f"Price: ${limit_price:.2f}\n"
+        msg += f"SL: ${sl_price:.2f}\n"
+        msg += f"TP: ${tp_price:.2f}"
+        send_telegram(msg)
+        
+        return order
+        
+    except Exception as e:
+        log_message(f"❌ Order placement error: {e}")
+        send_telegram(f"❌ Order Failed: {str(e)}")
+        return None
+
+# ============= MONITOR ORDERS (SL/TP Management) =============
+def monitor_active_orders():
+    """
+    WazirX doesn't support native SL/TP, so we monitor manually
+    """
+    try:
+        for order_id, order_info in list(active_orders.items()):
+            symbol = order_info['symbol']
+            current_price = get_current_price(symbol.upper())
+            
+            if not current_price:
+                continue
+            
+            entry_price = order_info['entry_price']
+            sl_price = order_info['sl_price']
+            tp_price = order_info['tp_price']
+            side = order_info['side']
+            quantity = order_info['quantity']
+            
+            # Check if order is filled
+            try:
+                order_status = exchange.fetch_order(order_id, symbol.upper())
+                if order_status['status'] != 'closed':
+                    continue  # Order not filled yet
+            except:
+                continue
+            
+            # Check SL/TP conditions
+            should_close = False
+            close_reason = ""
+            
+            if side == 'buy':
+                # Long position
+                if current_price <= sl_price:
+                    should_close = True
+                    close_reason = "SL Hit"
+                elif current_price >= tp_price:
+                    should_close = True
+                    close_reason = "TP Hit"
+            else:
+                # Short position
+                if current_price >= sl_price:
+                    should_close = True
+                    close_reason = "SL Hit"
+                elif current_price <= tp_price:
+                    should_close = True
+                    close_reason = "TP Hit"
+            
+            # Close position if needed
+            if should_close:
+                close_side = 'sell' if side == 'buy' else 'buy'
+                close_order = exchange.create_market_order(
+                    symbol=symbol.upper(),
+                    side=close_side,
+                    amount=quantity
+                )
+                
+                # Calculate P&L
+                if side == 'buy':
+                    pnl = (current_price - entry_price) * quantity
+                else:
+                    pnl = (entry_price - current_price) * quantity
+                
+                global daily_pnl_usdt, winning_trades_today, losing_trades_today
+                daily_pnl_usdt += pnl
+                
+                if pnl > 0:
+                    winning_trades_today += 1
+                else:
+                    losing_trades_today += 1
+                
+                log_message(f"🔔 Position closed: {close_reason} | P&L: ${pnl:.2f}")
+                
+                # Telegram notification
+                emoji = "✅" if pnl > 0 else "❌"
+                msg = f"{emoji} <b>Position Closed</b>\n"
+                msg += f"Reason: {close_reason}\n"
+                msg += f"P&L: ${pnl:.2f}\n"
+                msg += f"Symbol: {symbol.upper()}"
+                send_telegram(msg)
+                
+                # Remove from active orders
+                del active_orders[order_id]
+                
+    except Exception as e:
+        log_message(f"❌ Order monitoring error: {e}")
+
+# ============= WEBHOOK ENDPOINT =============
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
-        raw_data = request.get_data()
-        data = json.loads(raw_data)
+        data = request.json
+        log_message("\n" + "="*80)
+        log_message(f"📨 ALERT RECEIVED | {datetime.now()}")
+        log_message(json.dumps(data, indent=2))
+        log_message("="*80)
         
-        log_message(f"📥 Signal: {json.dumps(data)}")
-        
-        # Validation
-        safe, msg = check_safety_limits(data)
-        if not safe:
+        # Safety checks
+        is_safe, msg = check_safety_limits(data)
+        if not is_safe:
+            log_message(msg)
             return jsonify({"status": "rejected", "reason": msg}), 400
-            
-        symbol_raw = data.get('symbol', 'BTCUSD')
-        symbol = SYMBOL_MAP.get(symbol_raw, symbol_raw)
-        if "/USDT" not in symbol: symbol += "/USDT"
         
-        action = data.get('action', '').lower()
+        # Extract data
+        action = data.get('action', '').upper()
+        tv_symbol = data.get('symbol', '')
         price = float(data.get('price', 0))
         sl = float(data.get('sl', 0))
         tp = float(data.get('tp', 0))
         
-        if price <= 0 or sl <= 0:
-            return jsonify({"status": "error", "reason": "Invalid Price/SL"}), 400
-
-        # Process
-        qty, q_msg = calculate_position_size(symbol, price, sl)
-        if qty <= 0:
-            return jsonify({"status": "error", "reason": q_msg}), 400
-            
-        order_id = execute_trade(symbol, action, qty, price, sl, tp)
+        # Map symbol to WazirX format
+        symbol = SYMBOL_MAP.get(tv_symbol, tv_symbol).lower()
         
-        if order_id:
-            return jsonify({"status": "success", "id": order_id}), 200
-        return jsonify({"status": "error", "reason": "Execution failed"}), 500
-
+        # Validate
+        if action not in ['BUY', 'SELL']:
+            return jsonify({"status": "error", "reason": "Invalid action"}), 400
+        
+        if price <= 0 or sl <= 0 or tp <= 0:
+            return jsonify({"status": "error", "reason": "Invalid price/SL/TP"}), 400
+        
+        # Calculate position size
+        side = 'buy' if action == 'BUY' else 'sell'
+        quantity, qty_msg = calculate_position_size(symbol, price, sl)
+        
+        if quantity <= 0:
+            return jsonify({"status": "error", "reason": f"Position size error: {qty_msg}"}), 400
+        
+        # Place order
+        order = place_order(symbol, side, quantity, price, sl, tp)
+        
+        if order:
+            global total_trades_today
+            total_trades_today += 1
+            
+            return jsonify({
+                "status": "success",
+                "order_id": order.get('id'),
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "entry_price": price,
+                "sl": sl,
+                "tp": tp,
+                "trades_today": total_trades_today
+            }), 200
+        else:
+            return jsonify({"status": "error", "reason": "Order placement failed"}), 500
+        
     except Exception as e:
-        log_message(f"🚨 Webhook Crash: {e}")
+        log_message(f"❌ Webhook error: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
-def check_safety_limits(data):
-    if not TRADING_ENABLED: return False, "Trading Disabled"
-    
-    with data_lock:
-        if abs(daily_pnl_usdt) >= MAX_DAILY_LOSS_USDT:
-            return False, "Daily Loss Limit Reached"
-        if len(active_orders) >= MAX_OPEN_POSITIONS:
-            return False, "Max Positions Open"
-            
-    return True, "Safe"
-
-@app.route('/health')
+# ============= HEALTH CHECK =============
+@app.route('/health', methods=['GET'])
 def health():
-    balance = fetch_safe_balance()
+    try:
+        balance = get_balance()
+        
+        return jsonify({
+            "status": "running",
+            "exchange": "WazirX",
+            "balance_usdt": balance['usdt_free'],
+            "daily_pnl_usdt": daily_pnl_usdt,
+            "trades_today": total_trades_today,
+            "winning_trades": winning_trades_today,
+            "losing_trades": losing_trades_today,
+            "active_orders": len(active_orders),
+            "time": str(datetime.now())
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# ============= GET POSITIONS =============
+@app.route('/positions', methods=['GET'])
+def get_positions():
     return jsonify({
-        "status": "alive",
-        "balance_usdt": balance['free'] if balance else "Error",
-        "active_trades": len(active_orders),
-        "daily_pnl": f"${daily_pnl_usdt:.2f}"
+        "active_orders": len(active_orders),
+        "orders": list(active_orders.values())
     }), 200
 
-# ============= MAIN START =============
-if __name__ == '__main__':
-    log_message("🚀 Bot starting...")
+# ============= BACKGROUND ORDER MONITOR =============
+def start_order_monitor():
+    import threading
     
-    # Verify Connection
-    test_balance = fetch_safe_balance()
-    if test_balance is not None:
-        log_message(f"✅ Connected to WazirX. Balance: ${test_balance['free']}")
-    else:
-        log_message("❌ Connection Failed! Check API Keys and IP restrictions.")
+    def monitor_loop():
+        while True:
+            try:
+                monitor_active_orders()
+                time.sleep(5)  # Check every 5 seconds
+            except Exception as e:
+                log_message(f"❌ Monitor loop error: {e}")
+                time.sleep(10)
+    
+    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread.start()
+    log_message("✅ Order monitor thread started")
 
-    # Start Monitor Thread
-    t = threading.Thread(target=monitor_positions, daemon=True)
-    t.start()
+# ============= MAIN =============
+if __name__ == '__main__':
+    log_message("\n" + "="*80)
+    log_message("🚀 WAZIRX ICT TRADING BOT STARTING...")
+    log_message(f"Trading Enabled: {TRADING_ENABLED}")
+    log_message(f"Dry Run: {DRY_RUN}")
+    log_message(f"Allowed Symbols: {ALLOWED_SYMBOLS}")
+    log_message("="*80 + "\n")
     
-    # Render dynamic port
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host='0.0.0.0', port=port)
+    # Start order monitoring
+    start_order_monitor()
+    
+    # Start Flask server
+    app.run(host='0.0.0.0', port=5000, debug=False)
